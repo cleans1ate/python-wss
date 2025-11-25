@@ -1,1 +1,61 @@
+# WSSE mTLS SOAP Client Configuration
 
+# Endpoint Configuration
+endpoint:
+  wsdl_url: "https://your-service.com/service?wsdl"
+  soap_url: "https://your-service.com/service"
+  timeout: 30  # seconds
+  verify_ssl: true
+
+# mTLS Configuration (for transport layer security)
+mtls:
+  client_cert: "certs/client_cert.pem"
+  client_key: "certs/client_key.pem"
+  client_key_password: null  # If key is encrypted
+  server_ca: "certs/server_ca.pem"  # Optional, for custom CA
+
+# WS-Security Configuration (for message layer security)
+wsse:
+  # Certificate for encrypting the request
+  encryption:
+    cert: "certs/encryption_cert.pem"
+    algorithm: "AES-128"  # Options: AES-128, AES-256
+    
+  # Certificate and key for signing the request
+  signing:
+    cert: "certs/signing_cert.pem"
+    key: "certs/signing_key.pem"
+    key_password: null  # If key is encrypted
+    algorithm: "RSA-SHA256"  # Options: RSA-SHA1, RSA-SHA256
+    
+  # Timestamp settings
+  timestamp:
+    ttl: 300  # Time-to-live in seconds (5 minutes)
+    
+  # Elements to encrypt (XPath expressions)
+  encrypt_elements:
+    - "//soapenv:Body"
+    
+  # Elements to sign (XPath expressions)
+  sign_elements:
+    - "//soapenv:Body"
+    - "//wsu:Timestamp"
+
+# Request defaults
+request_defaults:
+  channel_ind: "MOB"
+  client_search_type: "X01"
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  log_file: "wsse_client.log"
+  log_requests: true
+  log_responses: true
+  mask_sensitive: true  # Mask sensitive data in logs
+
+# Retry configuration
+retry:
+  max_attempts: 3
+  backoff_factor: 2  # Exponential backoff
+  retry_on_status: [500, 502, 503, 504]

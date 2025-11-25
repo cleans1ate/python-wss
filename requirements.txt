@@ -1,0 +1,26 @@
+# Required Python packages for WSSE mTLS SOAP Client
+
+# SOAP/XML handling
+zeep==4.2.1
+lxml==4.9.3
+requests==2.31.0
+
+# Cryptography and certificate handling
+cryptography==41.0.7
+pyOpenSSL==23.3.0
+
+# XML Security (for encryption/decryption/signing)
+xmlsec==1.3.13
+
+# Optional: for better debugging
+urllib3==2.1.0
+certifi==2023.11.17
+
+# Installation instructions:
+# pip install -r requirements.txt
+#
+# Note: xmlsec requires system dependencies:
+# - Ubuntu/Debian: sudo apt-get install libxml2-dev libxmlsec1-dev libxmlsec1-openssl pkg-config
+# - CentOS/RHEL: sudo yum install libxml2-devel xmlsec1-devel xmlsec1-openssl-devel
+# - macOS: brew install libxml2 libxmlsec1
+# - Windows: Download from https://www.zlatkovic.com/libxml.en.html

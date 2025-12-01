@@ -235,58 +235,7 @@ class CompleteWSSEClient:
         encrypted = enc_ctx.encrypt_xml(enc_data, body)
         
         return envelope
-    
-    def send_request(self, channel_ind, cif_static_key, client_search_type,
-                    business_client_name='', city='', state='', zip_code='', ssn_tin=''):
-        """
-        Create, sign, encrypt and send SOAP request
-        
-        Returns:
-            Response object
-        """
-        # Create plain request
-        envelope = self.create_plain_request(
-            channel_ind, cif_static_key, client_search_type,
-            business_client_name, city, state, zip_code, ssn_tin
-        )
-        
-        print("1. Plain request created")
-        
-        # Add WSSE header
-        envelope, security, bst_id, timestamp_id = self.add_wsse_header(envelope)
-        print("2. WSSE header added")
-        
-        # Sign message
-        envelope = self.sign_message(envelope, security, bst_id, timestamp_id)
-        print("3. Message signed")
-        
-        # Encrypt body
-        envelope = self.encrypt_body(envelope)
-        print("4. Body encrypted")
-        
-        # Convert to string
-        request_xml = etree.tostring(envelope, pretty_print=True, xml_declaration=True, encoding='UTF-8')
-        
-        # Send request with mTLS
-        session = requests.Session()
-        session.cert = (self.client_cert, self.client_key)
-        session.verify = self.server_ca if self.server_ca else self.verify_ssl
-        
-        headers = {
-            'Content-Type': 'text/xml; charset=utf-8',
-            'SOAPAction': ''
-        }
-        
-        print(f"5. Sending request to {self.endpoint_url}")
-        response = session.post(
-            self.endpoint_url,
-            data=request_xml,
-            headers=headers,
-            timeout=30
-        )
-        
-        print(f"6. Response received: {response.status_code}")
-        return response
+
     
     def decrypt_response(self, response_xml):
         """Decrypt encrypted SOAP response"""
@@ -315,52 +264,3 @@ class CompleteWSSEClient:
             return root
 
 
-# Example Usage
-def main():
-    """Example usage"""
-    
-    # Configuration - UPDATE THESE PATHS
-    ENDPOINT_URL = "https://your-endpoint.com/service"
-    CLIENT_CERT = "certs/client_cert.pem"
-    CLIENT_KEY = "certs/client_key.pem"
-    ENCRYPTION_CERT = "certs/encryption_cert.pem"
-    SIGNING_CERT = "certs/signing_cert.pem"
-    SIGNING_KEY = "certs/signing_key.pem"
-    SERVER_CA = "certs/server_ca.pem"  # Optional
-    
-    # Create client
-    client = CompleteWSSEClient(
-        endpoint_url=ENDPOINT_URL,
-        client_cert=CLIENT_CERT,
-        client_key=CLIENT_KEY,
-        encryption_cert=ENCRYPTION_CERT,
-        signing_cert=SIGNING_CERT,
-        signing_key=SIGNING_KEY,
-        server_ca=SERVER_CA,
-        verify_ssl=True
-    )
-    
-    # Send request
-    try:
-        response = client.send_request(
-            channel_ind='MOB',
-            cif_static_key='88462327',
-            client_search_type='X01'
-        )
-        
-        print(f"\nStatus Code: {response.status_code}")
-        print(f"Response Headers: {response.headers}")
-        
-        # Decrypt response
-        decrypted = client.decrypt_response(response.content)
-        print("\nDecrypted Response:")
-        print(etree.tostring(decrypted, pretty_print=True).decode())
-        
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-if __name__ == "__main__":
-    main()

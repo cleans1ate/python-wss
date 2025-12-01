@@ -41,11 +41,6 @@ wsse:
     - "//soapenv:Body"
     - "//wsu:Timestamp"
 
-# Request defaults
-request_defaults:
-  channel_ind: "MOB"
-  client_search_type: "X01"
-
 # Logging
 logging:
   level: "INFO"  # DEBUG, INFO, WARNING, ERROR

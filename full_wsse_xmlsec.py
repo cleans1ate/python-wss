@@ -73,39 +73,7 @@ class CompleteWSSEClient:
             else:
                 self.enc_cert_obj = x509.load_der_x509_certificate(cert_data, default_backend())
     
-    def create_plain_request(self, channel_ind, cif_static_key, client_search_type,
-                            business_client_name='', city='', state='', zip_code='', ssn_tin=''):
-        """Create plain SOAP request (before encryption)"""
-        
-        # Create SOAP envelope
-        envelope = etree.Element(
-            f"{{{self.NSMAP['soapenv']}}}Envelope",
-            nsmap={'soapenv': self.NSMAP['soapenv'], 'ns1': self.NSMAP['ns1']}
-        )
-        
-        header = etree.SubElement(envelope, f"{{{self.NSMAP['soapenv']}}}Header")
-        body = etree.SubElement(envelope, f"{{{self.NSMAP['soapenv']}}}Body")
-        
-        # Add request content
-        search_request = etree.SubElement(body, f"{{{self.NSMAP['ns1']}}}ClientSearchRequest")
-        
-        elements = {
-            'ChannelInd': channel_ind,
-            'CIFStaticKey': cif_static_key,
-            'ClientSearchType': client_search_type,
-            'BusinessClientName': business_client_name,
-            'City': city,
-            'State': state,
-            'ZIP': zip_code,
-            'SSN-TIN': ssn_tin
-        }
-        
-        for elem_name, elem_value in elements.items():
-            if elem_value:  # Only add non-empty values
-                elem = etree.SubElement(search_request, f"{{{self.NSMAP['ns1']}}}{elem_name}")
-                elem.text = elem_value
-        
-        return envelope
+    
     
     def add_wsse_header(self, envelope):
         """Add WS-Security header with timestamp and binary security token"""

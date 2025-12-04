@@ -1,15 +1,9 @@
-"""
-SOAP Client with WS-Security (WSSE) supporting both mTLS and Basic Auth
-Handles XML encryption, signing, and mutual TLS authentication
-"""
-
 import requests
 from lxml import etree
 from zeep import Client, Settings
 from zeep.transports import Transport
 from zeep.wsse.signature import Signature
 from requests import Session
-from requests.auth import HTTPBasicAuth
 import base64
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -20,102 +14,55 @@ import uuid
 
 
 class WSSEMTLSClient:
-    """SOAP client with WS-Security supporting both mTLS and Basic Auth"""
+    """SOAP client with WS-Security and mTLS support"""
     
     def __init__(self, 
                  wsdl_url,
                  endpoint_url,
-                 # mTLS parameters (optional if using Basic Auth)
-                 client_cert_path=None,
-                 client_key_path=None,
+                 client_cert_path,
+                 client_key_path,
                  server_cert_path=None,
-                 # Basic Auth parameters (optional if using mTLS)
-                 username=None,
-                 password=None,
-                 # WS-Security parameters
                  encryption_cert_path=None,
                  signing_cert_path=None,
-                 signing_key_path=None,
-                 # Auth mode
-                 auth_mode='mtls'):  # 'mtls' or 'basic'
+                 signing_key_path=None):
         """
-        Initialize the WSSE client with mTLS or Basic Auth
+        Initialize the WSSE mTLS client
         
         Args:
             wsdl_url: WSDL service URL
             endpoint_url: Actual endpoint URL
-            
-            # For mTLS:
             client_cert_path: Path to client certificate for mTLS (.crt or .pem)
             client_key_path: Path to client private key for mTLS (.key or .pem)
             server_cert_path: Path to server CA certificate (optional)
-            
-            # For Basic Auth:
-            username: Basic auth username
-            password: Basic auth password
-            
-            # For WS-Security:
             encryption_cert_path: Path to encryption certificate (.crt)
             signing_cert_path: Path to signing certificate (.crt)
             signing_key_path: Path to signing private key (.key)
-            
-            # Auth mode:
-            auth_mode: 'mtls' or 'basic' (default: 'mtls')
         """
         self.wsdl_url = wsdl_url
         self.endpoint_url = endpoint_url
-        self.auth_mode = auth_mode
-        
-        # mTLS settings
         self.client_cert_path = client_cert_path
         self.client_key_path = client_key_path
         self.server_cert_path = server_cert_path
-        
-        # Basic Auth settings
-        self.username = username
-        self.password = password
-        
-        # WS-Security settings
         self.encryption_cert_path = encryption_cert_path
         self.signing_cert_path = signing_cert_path
         self.signing_key_path = signing_key_path
         
-        # Setup session based on auth mode
-        self.session = self._create_session()
+        # Setup session with mTLS
+        self.session = self._create_mtls_session()
         
-    def _create_session(self):
-        """Create requests session with mTLS or Basic Auth"""
+    def _create_mtls_session(self):
+        """Create requests session with mTLS configuration"""
         session = Session()
         
-        if self.auth_mode == 'mtls':
-            # Configure mTLS
-            if not self.client_cert_path or not self.client_key_path:
-                raise ValueError("mTLS mode requires client_cert_path and client_key_path")
-            
-            session.cert = (self.client_cert_path, self.client_key_path)
-            print(f"✓ mTLS configured with certificate: {self.client_cert_path}")
-            
-            # Configure server certificate verification
-            if self.server_cert_path:
-                session.verify = self.server_cert_path
-            else:
-                session.verify = True
-                
-        elif self.auth_mode == 'basic':
-            # Configure Basic Authentication
-            if not self.username or not self.password:
-                raise ValueError("Basic auth mode requires username and password")
-            
-            session.auth = HTTPBasicAuth(self.username, self.password)
-            print(f"✓ Basic Auth configured for user: {self.username}")
-            
-            # Still verify SSL in basic auth mode
-            if self.server_cert_path:
-                session.verify = self.server_cert_path
-            else:
-                session.verify = True
+        # Configure client certificate for mTLS
+        session.cert = (self.client_cert_path, self.client_key_path)
+        
+        # Configure server certificate verification
+        if self.server_cert_path:
+            session.verify = self.server_cert_path
         else:
-            raise ValueError(f"Invalid auth_mode: {self.auth_mode}. Use 'mtls' or 'basic'")
+            # In production, always verify! This is for testing only
+            session.verify = True
             
         return session
     
@@ -174,7 +121,7 @@ class WSSEMTLSClient:
     
     def send_request(self, operation_name, **kwargs):
         """
-        Send SOAP request with WS-Security and mTLS/Basic Auth
+        Send SOAP request with WS-Security and mTLS
         
         Args:
             operation_name: SOAP operation name
@@ -248,16 +195,15 @@ class WSSEMTLSClient:
     
     def decrypt_response(self, response_xml):
         """
-        Decrypt encrypted SOAP response
+        Decrypt encrypted SOAP response using xmlsec
         
         Args:
             response_xml: Encrypted response XML (string or bytes)
             
         Returns:
-            Decrypted XML
+            Decrypted XML element tree
         """
-        # This is a placeholder - actual decryption requires xmlsec library
-        # For production use, implement proper XML decryption
+        import xmlsec
         
         if isinstance(response_xml, bytes):
             response_xml = response_xml.decode('utf-8')
@@ -269,8 +215,87 @@ class WSSEMTLSClient:
         XENC_NS = "http://www.w3.org/2001/04/xmlenc#"
         encrypted_elements = root.findall(f".//{{{XENC_NS}}}EncryptedData")
         
-        if encrypted_elements:
-            print("Response contains encrypted data. Decryption required.")
-            # Implement decryption logic here using xmlsec
-            
+        if not encrypted_elements:
+            print("No encrypted data found in response.")
+            return root
+        
+        print(f"Found {len(encrypted_elements)} encrypted element(s). Decrypting...")
+        
+        # Load the private key for decryption
+        if not self.client_key_path:
+            raise ValueError("Client private key path is required for decryption")
+        
+        # Load private key
+        with open(self.client_key_path, 'rb') as key_file:
+            key_data = key_file.read()
+        
+        # Create key manager
+        key_manager = xmlsec.KeysManager()
+        
+        # Load the key
+        if b'-----BEGIN' in key_data:
+            # PEM format
+            key = xmlsec.Key.from_memory(key_data, xmlsec.constants.KeyDataFormatPem)
+        else:
+            # DER format
+            key = xmlsec.Key.from_memory(key_data, xmlsec.constants.KeyDataFormatDer)
+        
+        # If we have a certificate, load it too
+        if self.encryption_cert_path:
+            with open(self.encryption_cert_path, 'rb') as cert_file:
+                cert_data = cert_file.read()
+                key.load_cert_from_memory(cert_data, xmlsec.constants.KeyDataFormatPem)
+        
+        # Add key to manager
+        key_manager.add_key(key)
+        
+        # Decrypt each encrypted element
+        for encrypted_element in encrypted_elements:
+            try:
+                # Create encryption context
+                enc_ctx = xmlsec.EncryptionContext(key_manager)
+                
+                # Decrypt the element
+                decrypted_data = enc_ctx.decrypt(encrypted_element)
+                
+                # Replace encrypted element with decrypted content
+                parent = encrypted_element.getparent()
+                if parent is not None:
+                    # Parse decrypted data
+                    decrypted_tree = etree.fromstring(decrypted_data)
+                    
+                    # Replace the EncryptedData element with decrypted content
+                    parent.replace(encrypted_element, decrypted_tree)
+                    print("Successfully decrypted element")
+                
+            except Exception as e:
+                print(f"Error decrypting element: {e}")
+                # Try alternative decryption method
+                try:
+                    self._decrypt_element_alternative(encrypted_element, key_manager)
+                except Exception as e2:
+                    print(f"Alternative decryption also failed: {e2}")
+                    raise
+        
         return root
+    
+    def _decrypt_element_alternative(self, encrypted_element, key_manager):
+        """
+        Alternative decryption method for different encryption formats
+        
+        Args:
+            encrypted_element: EncryptedData XML element
+            key_manager: xmlsec KeysManager
+        """
+        import xmlsec
+        
+        # Try to decrypt using the parent document
+        enc_ctx = xmlsec.EncryptionContext(key_manager)
+        
+        # Get the entire document
+        doc = encrypted_element.getroottree()
+        
+        # Find and decrypt
+        enc_ctx.decrypt(encrypted_element)
+        
+        print("Alternative decryption successful")

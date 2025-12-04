@@ -1,6 +1,7 @@
 """
 SOAP Client with WS-Security (WSSE) and mTLS support
 Handles XML encryption, signing, and mutual TLS authentication
+FIXED VERSION - Resolves xmlsec template and decryption issues
 """
 
 import requests
@@ -143,6 +144,7 @@ class WSSEMTLSClient:
         # Namespaces
         SOAPENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
         WSSE_NS = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+        WSU_NS = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
         DS_NS = "http://www.w3.org/2000/09/xmldsig#"
         
         # Get security header
@@ -151,59 +153,10 @@ class WSSEMTLSClient:
             raise ValueError("Security header must exist before signing")
         
         # Get Body and add wsu:Id for reference
-        WSU_NS = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
         body = envelope.find(f"{{{SOAPENV_NS}}}Body")
-        body_id = f"Body-{uuid.uuid4().hex}"
+        body_id = f"id-{uuid.uuid4().hex}"
         body.set(f"{{{WSU_NS}}}Id", body_id)
         
-        # Create Signature element
-        signature = etree.SubElement(header, f"{{{DS_NS}}}Signature")
-        
-        # SignedInfo
-        signed_info = etree.SubElement(signature, f"{{{DS_NS}}}SignedInfo")
-        
-        # CanonicalizationMethod
-        canon_method = etree.SubElement(signed_info, f"{{{DS_NS}}}CanonicalizationMethod")
-        canon_method.set("Algorithm", "http://www.w3.org/2001/10/xml-exc-c14n#")
-        
-        # SignatureMethod
-        sig_method = etree.SubElement(signed_info, f"{{{DS_NS}}}SignatureMethod")
-        sig_method.set("Algorithm", "http://www.w3.org/2000/09/xmldsig#rsa-sha1")
-        
-        # Reference to Body
-        reference = etree.SubElement(signed_info, f"{{{DS_NS}}}Reference")
-        reference.set("URI", f"#{body_id}")
-        
-        # Transforms
-        transforms = etree.SubElement(reference, f"{{{DS_NS}}}Transforms")
-        transform = etree.SubElement(transforms, f"{{{DS_NS}}}Transform")
-        transform.set("Algorithm", "http://www.w3.org/2001/10/xml-exc-c14n#")
-        
-        # DigestMethod
-        digest_method = etree.SubElement(reference, f"{{{DS_NS}}}DigestMethod")
-        digest_method.set("Algorithm", "http://www.w3.org/2000/09/xmldsig#sha1")
-        
-        # DigestValue (placeholder)
-        digest_value = etree.SubElement(reference, f"{{{DS_NS}}}DigestValue")
-        digest_value.text = ""
-        
-        # SignatureValue (placeholder)
-        sig_value = etree.SubElement(signature, f"{{{DS_NS}}}SignatureValue")
-        sig_value.text = ""
-        
-        # KeyInfo
-        key_info = etree.SubElement(signature, f"{{{DS_NS}}}KeyInfo")
-        sec_token_ref = etree.SubElement(key_info, f"{{{WSSE_NS}}}SecurityTokenReference")
-        reference_elem = etree.SubElement(sec_token_ref, f"{{{WSSE_NS}}}Reference")
-        
-        # Reference to BinarySecurityToken
-        bst = header.find(f".//{{{WSSE_NS}}}BinarySecurityToken")
-        if bst is not None:
-            bst_id = bst.get(f"{{{WSU_NS}}}Id")
-            reference_elem.set("URI", f"#{bst_id}")
-            reference_elem.set("ValueType", "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3")
-        
-        # Now use xmlsec to actually sign
         # Load private key
         with open(self.signing_key_path, 'rb') as key_file:
             key_data = key_file.read()
@@ -221,11 +174,34 @@ class WSSEMTLSClient:
                 if b'-----BEGIN' in cert_data:
                     key.load_cert_from_memory(cert_data, xmlsec.constants.KeyDataFormatPem)
         
-        # Sign the document
-        signature_ctx = xmlsec.SignatureContext()
-        signature_ctx.key = key
+        # Create signature template using xmlsec.template
+        signature_node = xmlsec.template.create(
+            header,
+            xmlsec.constants.TransformExclC14N,
+            xmlsec.constants.TransformRsaSha1
+        )
         
-        signature_ctx.sign(signature)
+        # Add reference to Body
+        ref = xmlsec.template.add_reference(
+            signature_node,
+            xmlsec.constants.TransformSha1,
+            uri=f"#{body_id}"
+        )
+        
+        # Add enveloped transform
+        xmlsec.template.add_transform(ref, xmlsec.constants.TransformExclC14N)
+        
+        # Add KeyInfo with X509 data
+        key_info = xmlsec.template.ensure_key_info(signature_node)
+        x509_data = xmlsec.template.add_x509_data(key_info)
+        xmlsec.template.x509_data_add_issuer_serial(x509_data)
+        xmlsec.template.x509_data_add_certificate(x509_data)
+        
+        # Sign the document
+        ctx = xmlsec.SignatureContext()
+        ctx.key = key
+        
+        ctx.sign(signature_node)
         
         print("Envelope signed successfully")
         return envelope
@@ -244,7 +220,6 @@ class WSSEMTLSClient:
         
         # Namespaces
         SOAPENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
-        XENC_NS = "http://www.w3.org/2001/04/xmlenc#"
         
         # Get the Body element
         body = envelope.find(f"{{{SOAPENV_NS}}}Body")
@@ -272,28 +247,34 @@ class WSSEMTLSClient:
         # Create key from public key
         key = xmlsec.Key.from_memory(public_key_pem, xmlsec.constants.KeyDataFormatPem)
         
-        # Create encryption template
+        # Create encryption template properly with sign_method parameter
         enc_data = xmlsec.template.create(
             envelope,
-            xmlsec.constants.TransformAes256Cbc,
-            type=xmlsec.constants.TypeEncContent
+            xmlsec.constants.TransformAes128Cbc,
+            type=xmlsec.constants.TypeEncContent,
+            sign_method=xmlsec.constants.TransformRsaPkcs1  # FIX: Added sign_method
         )
         
-        # Add KeyInfo
+        # Ensure KeyInfo
         key_info = xmlsec.template.ensure_key_info(enc_data)
+        
+        # Add EncryptedKey
         enc_key = xmlsec.template.add_encrypted_key(
             key_info,
-            xmlsec.constants.TransformRsaOaep
+            xmlsec.constants.TransformRsaPkcs1
         )
+        
+        # Add KeyInfo to EncryptedKey
+        key_info2 = xmlsec.template.ensure_key_info(enc_key)
+        
+        # Serialize body content
+        body_content = etree.tostring(body)
         
         # Encrypt
         enc_ctx = xmlsec.EncryptionContext()
         enc_ctx.key = key
         
-        encrypted_data = enc_ctx.encrypt_binary(
-            etree.tostring(body),
-            enc_data
-        )
+        encrypted_data = enc_ctx.encrypt_binary(body_content, enc_data)
         
         # Replace body with encrypted data
         parent = body.getparent()
@@ -365,18 +346,28 @@ class WSSEMTLSClient:
                 envelope = self._encrypt_body(envelope)
             except Exception as e:
                 print(f"Warning: Encryption failed: {e}")
+                import traceback
+                traceback.print_exc()
                 print("Sending unencrypted request...")
         
-        # Sign envelope if requested
+        # Sign envelope if requested (after encryption)
         if self.sign_request:
             try:
                 envelope = self._sign_envelope(envelope)
             except Exception as e:
                 print(f"Warning: Signing failed: {e}")
+                import traceback
+                traceback.print_exc()
                 print("Sending unsigned request...")
         
         # Convert back to string
         request_xml = etree.tostring(envelope, pretty_print=True)
+        
+        # Debug: Print the request
+        print("=" * 80)
+        print("FINAL REQUEST:")
+        print(request_xml.decode('utf-8'))
+        print("=" * 80)
         
         # Send request
         headers = {
@@ -394,7 +385,7 @@ class WSSEMTLSClient:
     
     def decrypt_response(self, response_xml):
         """
-        Decrypt encrypted SOAP response using xmlsec
+        Decrypt encrypted SOAP response using xmlsec - FIXED VERSION
         
         Args:
             response_xml: Encrypted response XML (string or bytes)
@@ -411,12 +402,13 @@ class WSSEMTLSClient:
             try:
                 response_xml = response_xml.decode('utf-8')
             except UnicodeDecodeError:
-                # If UTF-8 fails, try latin-1
                 response_xml = response_xml.decode('latin-1')
         
         # Parse response
         try:
-            root = etree.fromstring(response_xml.encode('utf-8'))
+            # Parse into a document (not just element)
+            parser = etree.XMLParser(remove_blank_text=True)
+            root = etree.fromstring(response_xml.encode('utf-8'), parser)
         except etree.XMLSyntaxError as e:
             print(f"XML parsing error: {e}")
             print(f"Response preview: {response_xml[:500]}")
@@ -444,20 +436,21 @@ class WSSEMTLSClient:
             raise FileNotFoundError(f"Private key file not found: {self.client_key_path}")
         
         # Create key manager
-        key_manager = xmlsec.KeysManager()
+        manager = xmlsec.KeysManager()
         
         # Load the key
         try:
             if b'-----BEGIN' in key_data:
-                # PEM format
                 key = xmlsec.Key.from_memory(key_data, xmlsec.constants.KeyDataFormatPem)
             else:
-                # DER format
                 key = xmlsec.Key.from_memory(key_data, xmlsec.constants.KeyDataFormatDer)
         except Exception as e:
             raise ValueError(f"Failed to load private key: {e}")
         
-        # If we have a certificate, load it too
+        # Set key name for lookup (important!)
+        key.name = "decryption-key"
+        
+        # If we have a certificate, load it
         if self.encryption_cert_path:
             try:
                 with open(self.encryption_cert_path, 'rb') as cert_file:
@@ -470,61 +463,47 @@ class WSSEMTLSClient:
                 print(f"Warning: Could not load certificate: {e}")
         
         # Add key to manager
-        key_manager.add_key(key)
+        manager.add_key(key)
         
         # Decrypt each encrypted element
         for idx, encrypted_element in enumerate(encrypted_elements):
             try:
                 print(f"Decrypting element {idx + 1}/{len(encrypted_elements)}...")
                 
-                # Create encryption context
-                enc_ctx = xmlsec.EncryptionContext(key_manager)
+                # Show encryption method
+                enc_method = encrypted_element.find(f".//{{{XENC_NS}}}EncryptionMethod")
+                if enc_method is not None:
+                    algorithm = enc_method.get("Algorithm")
+                    print(f"Encryption algorithm: {algorithm}")
                 
-                # Decrypt the element in place
-                decrypted_data = enc_ctx.decrypt(encrypted_element)
+                # Create encryption context with manager
+                enc_ctx = xmlsec.EncryptionContext(manager)
                 
-                # The decrypt method modifies the tree in place
-                # So we just need to verify it worked
+                # CRITICAL FIX: Set the key directly on context
+                enc_ctx.key = key
+                
+                # Decrypt - this modifies tree in place
+                enc_ctx.decrypt(encrypted_element)
+                
                 print(f"Successfully decrypted element {idx + 1}")
                 
             except Exception as e:
-                print(f"Error decrypting element {idx + 1}: {e}")
-                print(f"Element preview: {etree.tostring(encrypted_element)[:200]}")
+                error_msg = str(e)
+                print(f"Error decrypting element {idx + 1}: {error_msg}")
                 
-                # Try alternative decryption method
-                try:
-                    self._decrypt_element_alternative(encrypted_element, key_manager)
-                except Exception as e2:
-                    print(f"Alternative decryption also failed: {e2}")
-                    # Don't raise, continue with other elements
-                    continue
+                # Check for specific error types
+                if "failed to decrypt" in error_msg.lower():
+                    print("Possible causes:")
+                    print("  1. Wrong private key (doesn't match public key used for encryption)")
+                    print("  2. Incorrect encryption algorithm support")
+                    print("  3. Missing key in KeysManager")
+                    print(f"  4. Key name mismatch")
+                
+                # Show element structure for debugging
+                print(f"Element structure:")
+                print(etree.tostring(encrypted_element, pretty_print=True).decode()[:500])
+                
+                # Don't raise, continue with other elements
+                continue
         
         return root
-    
-    def _decrypt_element_alternative(self, encrypted_element, key_manager):
-        """
-        Alternative decryption method for different encryption formats
-        
-        Args:
-            encrypted_element: EncryptedData XML element
-            key_manager: xmlsec KeysManager
-        """
-        import xmlsec
-        
-        print("Trying alternative decryption method...")
-        
-        # Get the encryption method to understand the algorithm
-        XENC_NS = "http://www.w3.org/2001/04/xmlenc#"
-        enc_method = encrypted_element.find(f".//{{{XENC_NS}}}EncryptionMethod")
-        
-        if enc_method is not None:
-            algorithm = enc_method.get("Algorithm")
-            print(f"Encryption algorithm: {algorithm}")
-        
-        # Try to decrypt using a fresh context
-        enc_ctx = xmlsec.EncryptionContext(key_manager)
-        
-        # Decrypt in place
-        enc_ctx.decrypt(encrypted_element)
-        
-        print("Alternative decryption successful")

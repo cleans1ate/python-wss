@@ -1,5 +1,5 @@
 """
-SOAP Client with WS-Security (WSSE) and mTLS support
+SOAP Client with WS-Security (WSSE) supporting both mTLS and Basic Auth
 Handles XML encryption, signing, and mutual TLS authentication
 """
 
@@ -9,6 +9,7 @@ from zeep import Client, Settings
 from zeep.transports import Transport
 from zeep.wsse.signature import Signature
 from requests import Session
+from requests.auth import HTTPBasicAuth
 import base64
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -19,55 +20,102 @@ import uuid
 
 
 class WSSEMTLSClient:
-    """SOAP client with WS-Security and mTLS support"""
+    """SOAP client with WS-Security supporting both mTLS and Basic Auth"""
     
     def __init__(self, 
                  wsdl_url,
                  endpoint_url,
-                 client_cert_path,
-                 client_key_path,
+                 # mTLS parameters (optional if using Basic Auth)
+                 client_cert_path=None,
+                 client_key_path=None,
                  server_cert_path=None,
+                 # Basic Auth parameters (optional if using mTLS)
+                 username=None,
+                 password=None,
+                 # WS-Security parameters
                  encryption_cert_path=None,
                  signing_cert_path=None,
-                 signing_key_path=None):
+                 signing_key_path=None,
+                 # Auth mode
+                 auth_mode='mtls'):  # 'mtls' or 'basic'
         """
-        Initialize the WSSE mTLS client
+        Initialize the WSSE client with mTLS or Basic Auth
         
         Args:
             wsdl_url: WSDL service URL
             endpoint_url: Actual endpoint URL
+            
+            # For mTLS:
             client_cert_path: Path to client certificate for mTLS (.crt or .pem)
             client_key_path: Path to client private key for mTLS (.key or .pem)
             server_cert_path: Path to server CA certificate (optional)
+            
+            # For Basic Auth:
+            username: Basic auth username
+            password: Basic auth password
+            
+            # For WS-Security:
             encryption_cert_path: Path to encryption certificate (.crt)
             signing_cert_path: Path to signing certificate (.crt)
             signing_key_path: Path to signing private key (.key)
+            
+            # Auth mode:
+            auth_mode: 'mtls' or 'basic' (default: 'mtls')
         """
         self.wsdl_url = wsdl_url
         self.endpoint_url = endpoint_url
+        self.auth_mode = auth_mode
+        
+        # mTLS settings
         self.client_cert_path = client_cert_path
         self.client_key_path = client_key_path
         self.server_cert_path = server_cert_path
+        
+        # Basic Auth settings
+        self.username = username
+        self.password = password
+        
+        # WS-Security settings
         self.encryption_cert_path = encryption_cert_path
         self.signing_cert_path = signing_cert_path
         self.signing_key_path = signing_key_path
         
-        # Setup session with mTLS
-        self.session = self._create_mtls_session()
+        # Setup session based on auth mode
+        self.session = self._create_session()
         
-    def _create_mtls_session(self):
-        """Create requests session with mTLS configuration"""
+    def _create_session(self):
+        """Create requests session with mTLS or Basic Auth"""
         session = Session()
         
-        # Configure client certificate for mTLS
-        session.cert = (self.client_cert_path, self.client_key_path)
-        
-        # Configure server certificate verification
-        if self.server_cert_path:
-            session.verify = self.server_cert_path
+        if self.auth_mode == 'mtls':
+            # Configure mTLS
+            if not self.client_cert_path or not self.client_key_path:
+                raise ValueError("mTLS mode requires client_cert_path and client_key_path")
+            
+            session.cert = (self.client_cert_path, self.client_key_path)
+            print(f"✓ mTLS configured with certificate: {self.client_cert_path}")
+            
+            # Configure server certificate verification
+            if self.server_cert_path:
+                session.verify = self.server_cert_path
+            else:
+                session.verify = True
+                
+        elif self.auth_mode == 'basic':
+            # Configure Basic Authentication
+            if not self.username or not self.password:
+                raise ValueError("Basic auth mode requires username and password")
+            
+            session.auth = HTTPBasicAuth(self.username, self.password)
+            print(f"✓ Basic Auth configured for user: {self.username}")
+            
+            # Still verify SSL in basic auth mode
+            if self.server_cert_path:
+                session.verify = self.server_cert_path
+            else:
+                session.verify = True
         else:
-            # In production, always verify! This is for testing only
-            session.verify = True
+            raise ValueError(f"Invalid auth_mode: {self.auth_mode}. Use 'mtls' or 'basic'")
             
         return session
     
@@ -126,7 +174,7 @@ class WSSEMTLSClient:
     
     def send_request(self, operation_name, **kwargs):
         """
-        Send SOAP request with WS-Security and mTLS
+        Send SOAP request with WS-Security and mTLS/Basic Auth
         
         Args:
             operation_name: SOAP operation name
@@ -226,5 +274,3 @@ class WSSEMTLSClient:
             # Implement decryption logic here using xmlsec
             
         return root
-
-

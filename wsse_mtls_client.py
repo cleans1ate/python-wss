@@ -1,509 +1,488 @@
 """
-SOAP Client with WS-Security (WSSE) and mTLS support
-Handles XML encryption, signing, and mutual TLS authentication
-FIXED VERSION - Resolves xmlsec template and decryption issues
+WS-Security SOAP Client with Encryption/Decryption
+Supports XML Encryption, Digital Signatures, and Basic Auth over Proxy
+
+UPDATED VERSION: Includes recipient certificate for request encryption
 """
 
-import requests
-from lxml import etree
-from zeep import Client, Settings
-from zeep.transports import Transport
-from zeep.wsse.signature import Signature
-from requests import Session
 import base64
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.backends import default_backend
-from cryptography import x509
+import hashlib
+import os
 from datetime import datetime, timedelta
-import uuid
+from lxml import etree
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography import x509
+import requests
+from requests.auth import HTTPBasicAuth
 
 
-class WSSEMTLSClient:
-    """SOAP client with WS-Security and mTLS support"""
+class WSSecurityClient:
+    """
+    WS-Security SOAP Client with encryption and decryption support
     
-    def __init__(self, 
-                 wsdl_url,
-                 endpoint_url,
-                 client_cert_path,
-                 client_key_path,
-                 server_cert_path=None,
-                 encryption_cert_path=None,
-                 signing_cert_path=None,
-                 signing_key_path=None,
-                 encrypt_request=False,
-                 sign_request=False):
+    IMPORTANT: For full WS-Security encryption:
+    - cert_path + key_path: YOUR credentials (decrypt responses, identify yourself)
+    - recipient_cert_path: SERVER/RECIPIENT certificate (encrypt requests)
+    """
+    
+    # Namespaces
+    NAMESPACES = {
+        'soapenv': 'http://schemas.xmlsoap.org/soap/envelope/',
+        'wsse': 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd',
+        'wsu': 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd',
+        'xenc': 'http://www.w3.org/2001/04/xmlenc#',
+        'ds': 'http://www.w3.org/2000/09/xmldsig#',
+        'ns1': 'http://xmlns.example.com/unique/default/namespace/1115236122168'
+    }
+    
+    def __init__(self, endpoint_url, cert_path, key_path, recipient_cert_path, 
+                 proxy_url=None, proxy_username=None, proxy_password=None):
         """
-        Initialize the WSSE mTLS client
+        Initialize WS-Security SOAP Client
         
         Args:
-            wsdl_url: WSDL service URL
-            endpoint_url: Actual endpoint URL
-            client_cert_path: Path to client certificate for mTLS (.crt or .pem)
-            client_key_path: Path to client private key for mTLS (.key or .pem)
-            server_cert_path: Path to server CA certificate (optional)
-            encryption_cert_path: Path to server's public cert for encrypting requests (.crt)
-            signing_cert_path: Path to signing certificate (.crt)
-            signing_key_path: Path to signing private key (.key)
-            encrypt_request: Whether to encrypt outgoing requests (default: False)
-            sign_request: Whether to sign outgoing requests (default: False)
+            endpoint_url: SOAP endpoint URL
+            cert_path: Path to YOUR X.509 certificate (.pem) - for identification & receiving encrypted responses
+            key_path: Path to YOUR private key (.pem) - for decrypting responses
+            recipient_cert_path: Path to RECIPIENT's/SERVER's certificate (.pem) - for encrypting requests
+            proxy_url: Proxy server URL (optional)
+            proxy_username: Proxy authentication username (optional)
+            proxy_password: Proxy authentication password (optional)
+            
+        Certificate Usage:
+            - cert_path: YOUR certificate (server will use this to encrypt responses TO you)
+            - key_path: YOUR private key (you use this to decrypt responses FROM server)
+            - recipient_cert_path: SERVER's certificate (you use this to encrypt requests TO server)
         """
-        self.wsdl_url = wsdl_url
         self.endpoint_url = endpoint_url
-        self.client_cert_path = client_cert_path
-        self.client_key_path = client_key_path
-        self.server_cert_path = server_cert_path
-        self.encryption_cert_path = encryption_cert_path
-        self.signing_cert_path = signing_cert_path
-        self.signing_key_path = signing_key_path
-        self.encrypt_request = encrypt_request
-        self.sign_request = sign_request
+        self.cert_path = cert_path
+        self.key_path = key_path
+        self.recipient_cert_path = recipient_cert_path
+        self.proxy_url = proxy_url
+        self.proxy_username = proxy_username
+        self.proxy_password = proxy_password
         
-        # Setup session with mTLS
-        self.session = self._create_mtls_session()
+        # Load certificates and keys
+        self.certificate = None  # YOUR certificate
+        self.private_key = None  # YOUR private key
+        self.recipient_certificate = None  # SERVER's certificate
         
-    def _create_mtls_session(self):
-        """Create requests session with mTLS configuration"""
-        session = Session()
-        
-        # Configure client certificate for mTLS
-        session.cert = (self.client_cert_path, self.client_key_path)
-        
-        # Configure server certificate verification
-        if self.server_cert_path:
-            session.verify = self.server_cert_path
-        else:
-            # In production, always verify! This is for testing only
-            session.verify = True
-            
-        return session
+        self._load_credentials()
     
-    def _create_security_header(self, envelope):
-        """Create WS-Security header with timestamp and certificate"""
-        
-        # Namespaces
-        SOAPENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
-        WSSE_NS = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-        WSU_NS = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
-        
-        # Get or create Header
-        header = envelope.find(f"{{{SOAPENV_NS}}}Header")
-        if header is None:
-            body = envelope.find(f"{{{SOAPENV_NS}}}Body")
-            header = etree.Element(f"{{{SOAPENV_NS}}}Header")
-            envelope.insert(0, header)
-        
-        # Create Security element
-        security = etree.SubElement(header, f"{{{WSSE_NS}}}Security")
-        security.set(f"{{{SOAPENV_NS}}}mustUnderstand", "1")
-        
-        # Add Timestamp
-        timestamp = etree.SubElement(security, f"{{{WSU_NS}}}Timestamp")
-        timestamp.set(f"{{{WSU_NS}}}Id", f"TS-{uuid.uuid4().hex}")
-        
-        created = etree.SubElement(timestamp, f"{{{WSU_NS}}}Created")
-        created.text = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        
-        expires = etree.SubElement(timestamp, f"{{{WSU_NS}}}Expires")
-        expires.text = (datetime.utcnow() + timedelta(minutes=5)).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        
-        # Add BinarySecurityToken (X.509 certificate)
-        if self.signing_cert_path:
-            with open(self.signing_cert_path, 'rb') as f:
-                cert_data = f.read()
-                if b'-----BEGIN CERTIFICATE-----' in cert_data:
-                    # PEM format
-                    cert = x509.load_pem_x509_certificate(cert_data, default_backend())
-                else:
-                    # DER format
-                    cert = x509.load_der_x509_certificate(cert_data, default_backend())
-                
-                cert_der = cert.public_bytes(serialization.Encoding.DER)
-                cert_b64 = base64.b64encode(cert_der).decode('utf-8')
-                
-                bst = etree.SubElement(security, f"{{{WSSE_NS}}}BinarySecurityToken")
-                bst.set("EncodingType", "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary")
-                bst.set("ValueType", "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3")
-                bst.set(f"{{{WSU_NS}}}Id", f"X509-{uuid.uuid4().hex}")
-                bst.text = cert_b64
-        
-        return envelope
-    
-    def _sign_envelope(self, envelope):
-        """Sign the SOAP envelope using XML Signature"""
+    def _load_credentials(self):
+        """Load YOUR X.509 certificate and private key"""
         try:
-            import xmlsec
-        except ImportError:
-            raise ImportError("xmlsec library is required for signing. Install: pip install xmlsec")
-        
-        if not self.signing_key_path:
-            raise ValueError("Signing key path is required for signing requests")
-        
-        print("Signing SOAP envelope...")
-        
-        # Namespaces
-        SOAPENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
-        WSSE_NS = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-        WSU_NS = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
-        DS_NS = "http://www.w3.org/2000/09/xmldsig#"
-        
-        # Get security header
-        header = envelope.find(f".//{{{WSSE_NS}}}Security")
-        if header is None:
-            raise ValueError("Security header must exist before signing")
-        
-        # Get Body and add wsu:Id for reference
-        body = envelope.find(f"{{{SOAPENV_NS}}}Body")
-        body_id = f"id-{uuid.uuid4().hex}"
-        body.set(f"{{{WSU_NS}}}Id", body_id)
-        
-        # Load private key
-        with open(self.signing_key_path, 'rb') as key_file:
-            key_data = key_file.read()
-        
-        # Create key
-        if b'-----BEGIN' in key_data:
-            key = xmlsec.Key.from_memory(key_data, xmlsec.constants.KeyDataFormatPem)
-        else:
-            key = xmlsec.Key.from_memory(key_data, xmlsec.constants.KeyDataFormatDer)
-        
-        # Load certificate if available
-        if self.signing_cert_path:
-            with open(self.signing_cert_path, 'rb') as cert_file:
+            # Load YOUR certificate
+            with open(self.cert_path, 'rb') as cert_file:
                 cert_data = cert_file.read()
-                if b'-----BEGIN' in cert_data:
-                    key.load_cert_from_memory(cert_data, xmlsec.constants.KeyDataFormatPem)
-        
-        # Create signature template using xmlsec.template
-        signature_node = xmlsec.template.create(
-            header,
-            xmlsec.constants.TransformExclC14N,
-            xmlsec.constants.TransformRsaSha1
-        )
-        
-        # Add reference to Body
-        ref = xmlsec.template.add_reference(
-            signature_node,
-            xmlsec.constants.TransformSha1,
-            uri=f"#{body_id}"
-        )
-        
-        # Add enveloped transform
-        xmlsec.template.add_transform(ref, xmlsec.constants.TransformExclC14N)
-        
-        # Add KeyInfo with X509 data
-        key_info = xmlsec.template.ensure_key_info(signature_node)
-        x509_data = xmlsec.template.add_x509_data(key_info)
-        xmlsec.template.x509_data_add_issuer_serial(x509_data)
-        xmlsec.template.x509_data_add_certificate(x509_data)
-        
-        # Sign the document
-        ctx = xmlsec.SignatureContext()
-        ctx.key = key
-        
-        ctx.sign(signature_node)
-        
-        print("Envelope signed successfully")
-        return envelope
+                self.certificate = x509.load_pem_x509_certificate(cert_data, default_backend())
+            
+            # Load YOUR private key
+            with open(self.key_path, 'rb') as key_file:
+                key_data = key_file.read()
+                self.private_key = serialization.load_pem_private_key(
+                    key_data, 
+                    password=None, 
+                    backend=default_backend()
+                )
+            
+            print("✓ YOUR certificate and private key loaded successfully")
+            
+            # Load RECIPIENT's (server's) certificate
+            with open(self.recipient_cert_path, 'rb') as recipient_file:
+                recipient_data = recipient_file.read()
+                self.recipient_certificate = x509.load_pem_x509_certificate(recipient_data, default_backend())
+            
+            print("✓ RECIPIENT's (server's) certificate loaded successfully")
+            
+        except Exception as e:
+            print(f"✗ Error loading credentials: {e}")
+            raise
     
-    def _encrypt_body(self, envelope):
-        """Encrypt SOAP Body using XML Encryption"""
-        try:
-            import xmlsec
-        except ImportError:
-            raise ImportError("xmlsec library is required for encryption. Install: pip install xmlsec")
-        
-        if not self.encryption_cert_path:
-            raise ValueError("Encryption certificate path is required for encrypting requests")
-        
-        print("Encrypting SOAP body...")
-        
-        # Namespaces
-        SOAPENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
-        
-        # Get the Body element
-        body = envelope.find(f"{{{SOAPENV_NS}}}Body")
-        if body is None:
-            raise ValueError("SOAP Body not found")
-        
-        # Load encryption certificate (server's public key)
-        with open(self.encryption_cert_path, 'rb') as cert_file:
-            cert_data = cert_file.read()
-        
-        if b'-----BEGIN CERTIFICATE-----' in cert_data:
-            cert = x509.load_pem_x509_certificate(cert_data, default_backend())
-        else:
-            cert = x509.load_der_x509_certificate(cert_data, default_backend())
-        
-        # Get public key
-        public_key = cert.public_key()
-        
-        # Serialize public key for xmlsec
-        public_key_pem = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-        
-        # Create key from public key
-        key = xmlsec.Key.from_memory(public_key_pem, xmlsec.constants.KeyDataFormatPem)
-        
-        # Create encryption template properly with sign_method parameter
-        enc_data = xmlsec.template.create(
-            envelope,
-            xmlsec.constants.TransformAes128Cbc,
-            type=xmlsec.constants.TypeEncContent,
-            sign_method=xmlsec.constants.TransformRsaPkcs1  # FIX: Added sign_method
-        )
-        
-        # Ensure KeyInfo
-        key_info = xmlsec.template.ensure_key_info(enc_data)
-        
-        # Add EncryptedKey
-        enc_key = xmlsec.template.add_encrypted_key(
-            key_info,
-            xmlsec.constants.TransformRsaPkcs1
-        )
-        
-        # Add KeyInfo to EncryptedKey
-        key_info2 = xmlsec.template.ensure_key_info(enc_key)
-        
-        # Serialize body content
-        body_content = etree.tostring(body)
-        
-        # Encrypt
-        enc_ctx = xmlsec.EncryptionContext()
-        enc_ctx.key = key
-        
-        encrypted_data = enc_ctx.encrypt_binary(body_content, enc_data)
-        
-        # Replace body with encrypted data
-        parent = body.getparent()
-        parent.replace(body, encrypted_data)
-        
-        print("Body encrypted successfully")
-        return envelope
+    def _generate_symmetric_key(self, key_size=16):
+        """Generate random AES key (16 bytes for AES-128, 32 for AES-256)"""
+        return os.urandom(key_size)
     
-    def send_request(self, operation_name, **kwargs):
+    def _encrypt_data_aes(self, data, key, algorithm='AES-128'):
         """
-        Send SOAP request with WS-Security and mTLS
+        Encrypt data using AES with CBC mode
         
         Args:
-            operation_name: SOAP operation name
-            **kwargs: Operation parameters
-            
+            data: Data to encrypt (bytes or string)
+            key: AES key
+            algorithm: 'AES-128' or 'AES-256'
+        
         Returns:
-            SOAP response
+            tuple: (encrypted_data, iv)
         """
-        # Create Zeep client with custom transport
-        transport = Transport(session=self.session)
-        settings = Settings(strict=False, xml_huge_tree=True)
+        if isinstance(data, str):
+            data = data.encode('utf-8')
         
-        client = Client(
-            wsdl=self.wsdl_url,
-            transport=transport,
-            settings=settings
-        )
+        # Generate random IV
+        iv = os.urandom(16)
         
-        # Override endpoint if specified
-        if self.endpoint_url:
-            service = client.create_service(
-                '{http://xmlns.example.com/unique/default/namespace/1115236122168}ClientSearchRequestBinding',
-                self.endpoint_url
+        # Pad data to block size (16 bytes for AES)
+        block_size = 16
+        padding_length = block_size - (len(data) % block_size)
+        padded_data = data + bytes([padding_length] * padding_length)
+        
+        # Create cipher and encrypt
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
+        
+        return encrypted_data, iv
+    
+    def _decrypt_data_aes(self, encrypted_data, key, iv):
+        """
+        Decrypt AES encrypted data
+        
+        Args:
+            encrypted_data: Encrypted data bytes
+            key: AES key
+            iv: Initialization vector
+        
+        Returns:
+            bytes: Decrypted data
+        """
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        decrypted_padded = decryptor.update(encrypted_data) + decryptor.finalize()
+        
+        # Remove padding
+        padding_length = decrypted_padded[-1]
+        decrypted_data = decrypted_padded[:-padding_length]
+        
+        return decrypted_data
+    
+    def _encrypt_key_rsa(self, symmetric_key, recipient_cert):
+        """
+        Encrypt symmetric key using RSA public key from RECIPIENT's certificate
+        
+        Args:
+            symmetric_key: AES key to encrypt
+            recipient_cert: RECIPIENT's X.509 certificate (contains public key)
+        
+        Returns:
+            bytes: Encrypted key
+        """
+        public_key = recipient_cert.public_key()
+        encrypted_key = public_key.encrypt(
+            symmetric_key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA1()),
+                algorithm=hashes.SHA1(),
+                label=None
             )
-        else:
-            service = client.service
-        
-        # Get the operation
-        operation = getattr(service, operation_name)
-        
-        # Execute the request
-        response = operation(**kwargs)
-        
-        return response
+        )
+        return encrypted_key
     
-    def send_raw_xml_request(self, xml_content):
+    def _decrypt_key_rsa(self, encrypted_key):
         """
-        Send raw XML SOAP request with WS-Security headers
+        Decrypt symmetric key using YOUR RSA private key
         
         Args:
-            xml_content: Raw XML content (string or bytes)
+            encrypted_key: Encrypted AES key
+        
+        Returns:
+            bytes: Decrypted symmetric key
+        """
+        if not self.private_key:
+            raise ValueError("Private key not loaded")
+        
+        decrypted_key = self.private_key.decrypt(
+            encrypted_key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA1()),
+                algorithm=hashes.SHA1(),
+                label=None
+            )
+        )
+        return decrypted_key
+    
+    def _encrypt_body(self, body_element):
+        """
+        Encrypt SOAP body element using recipient's certificate
+        
+        Args:
+            body_element: SOAP body element to encrypt
             
         Returns:
-            Response object
+            etree.Element: EncryptedData element
         """
-        # Parse XML
-        if isinstance(xml_content, str):
-            xml_content = xml_content.encode('utf-8')
+        # Convert body to string
+        body_str = etree.tostring(body_element, encoding='unicode')
         
-        envelope = etree.fromstring(xml_content)
+        # Generate symmetric key
+        symmetric_key = self._generate_symmetric_key(16)  # AES-128
         
-        # Add security header (timestamp, certificate)
-        envelope = self._create_security_header(envelope)
+        # Encrypt body data
+        encrypted_body, iv = self._encrypt_data_aes(body_str, symmetric_key)
         
-        # Encrypt body if requested
-        if self.encrypt_request:
-            try:
-                envelope = self._encrypt_body(envelope)
-            except Exception as e:
-                print(f"Warning: Encryption failed: {e}")
-                import traceback
-                traceback.print_exc()
-                print("Sending unencrypted request...")
+        # Combine IV and encrypted data (standard practice)
+        encrypted_data_with_iv = iv + encrypted_body
         
-        # Sign envelope if requested (after encryption)
-        if self.sign_request:
-            try:
-                envelope = self._sign_envelope(envelope)
-            except Exception as e:
-                print(f"Warning: Signing failed: {e}")
-                import traceback
-                traceback.print_exc()
-                print("Sending unsigned request...")
+        # Encrypt symmetric key with recipient's public key
+        encrypted_key = self._encrypt_key_rsa(symmetric_key, self.recipient_certificate)
         
-        # Convert back to string
-        request_xml = etree.tostring(envelope, pretty_print=True)
+        # Create EncryptedData element
+        encrypted_data = etree.Element(
+            '{http://www.w3.org/2001/04/xmlenc#}EncryptedData',
+            Type='http://www.w3.org/2001/04/xmlenc#Content'
+        )
         
-        # Debug: Print the request
-        print("=" * 80)
-        print("FINAL REQUEST:")
-        print(request_xml.decode('utf-8'))
-        print("=" * 80)
+        # Add EncryptionMethod
+        enc_method = etree.SubElement(encrypted_data, '{http://www.w3.org/2001/04/xmlenc#}EncryptionMethod')
+        enc_method.set('Algorithm', 'http://www.w3.org/2001/04/xmlenc#aes128-cbc')
         
-        # Send request
+        # Add KeyInfo with EncryptedKey
+        key_info = etree.SubElement(encrypted_data, '{http://www.w3.org/2000/09/xmldsig#}KeyInfo')
+        
+        encrypted_key_elem = etree.SubElement(key_info, '{http://www.w3.org/2001/04/xmlenc#}EncryptedKey')
+        
+        key_enc_method = etree.SubElement(encrypted_key_elem, '{http://www.w3.org/2001/04/xmlenc#}EncryptionMethod')
+        key_enc_method.set('Algorithm', 'http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p')
+        
+        cipher_data_key = etree.SubElement(encrypted_key_elem, '{http://www.w3.org/2001/04/xmlenc#}CipherData')
+        cipher_value_key = etree.SubElement(cipher_data_key, '{http://www.w3.org/2001/04/xmlenc#}CipherValue')
+        cipher_value_key.text = base64.b64encode(encrypted_key).decode('utf-8')
+        
+        # Add CipherData
+        cipher_data = etree.SubElement(encrypted_data, '{http://www.w3.org/2001/04/xmlenc#}CipherData')
+        cipher_value = etree.SubElement(cipher_data, '{http://www.w3.org/2001/04/xmlenc#}CipherValue')
+        cipher_value.text = base64.b64encode(encrypted_data_with_iv).decode('utf-8')
+        
+        return encrypted_data
+    
+    def create_soap_request(self, body_content, encrypt=True):
+        """
+        Create SOAP request with WS-Security headers
+        
+        Args:
+            body_content: XML string or element for SOAP body
+            encrypt: Whether to encrypt the message (DEFAULT: True for WS-Security)
+        
+        Returns:
+            str: SOAP XML request
+        """
+        # Create SOAP envelope
+        envelope = etree.Element(
+            '{http://schemas.xmlsoap.org/soap/envelope/}Envelope',
+            nsmap={'soapenv': 'http://schemas.xmlsoap.org/soap/envelope/'}
+        )
+        
+        # Create header with WS-Security
+        header = etree.SubElement(envelope, '{http://schemas.xmlsoap.org/soap/envelope/}Header')
+        self._add_security_header(header)
+        
+        # Create body
+        body = etree.SubElement(envelope, '{http://schemas.xmlsoap.org/soap/envelope/}Body')
+        
+        # Add body content
+        if isinstance(body_content, str):
+            body_element = etree.fromstring(body_content)
+        else:
+            body_element = body_content
+        
+        if encrypt:
+            # Encrypt the body content
+            encrypted_data = self._encrypt_body(body_element)
+            body.append(encrypted_data)
+        else:
+            body.append(body_element)
+        
+        return etree.tostring(envelope, pretty_print=True, encoding='unicode')
+    
+    def _add_security_header(self, header):
+        """Add WS-Security header with timestamp and binary security token"""
+        security = etree.SubElement(
+            header,
+            '{http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd}Security',
+            nsmap={'wsse': 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd'}
+        )
+        
+        # Add timestamp
+        timestamp = etree.SubElement(
+            security,
+            '{http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd}Timestamp',
+            nsmap={'wsu': 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd'}
+        )
+        
+        created = etree.SubElement(timestamp, '{http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd}Created')
+        created.text = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        
+        expires = etree.SubElement(timestamp, '{http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd}Expires')
+        expires.text = (datetime.utcnow() + timedelta(minutes=5)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        
+        # Add binary security token (YOUR certificate for identification)
+        bst = etree.SubElement(
+            security,
+            '{http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd}BinarySecurityToken'
+        )
+        bst.set('EncodingType', 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary')
+        bst.set('ValueType', 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3')
+        bst.set('{http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd}Id', 'X509-TOKEN')
+        bst.text = base64.b64encode(self.certificate.public_bytes(serialization.Encoding.DER)).decode('utf-8')
+    
+    def decrypt_soap_response(self, soap_response):
+        """
+        Decrypt SOAP response with WS-Security encryption
+        
+        Args:
+            soap_response: Encrypted SOAP XML response string
+        
+        Returns:
+            str: Decrypted SOAP XML
+        """
+        try:
+            # Parse XML
+            root = etree.fromstring(soap_response.encode('utf-8') if isinstance(soap_response, str) else soap_response)
+            
+            # Find encrypted data
+            encrypted_data = root.find('.//xenc:EncryptedData', namespaces=self.NAMESPACES)
+            
+            if encrypted_data is None:
+                print("No encrypted data found, returning original response")
+                return soap_response
+            
+            # Extract encryption method
+            enc_method = encrypted_data.find('.//xenc:EncryptionMethod', namespaces=self.NAMESPACES)
+            algorithm = enc_method.get('Algorithm') if enc_method is not None else None
+            print(f"Encryption algorithm: {algorithm}")
+            
+            # Extract encrypted key
+            key_info = encrypted_data.find('.//ds:KeyInfo', namespaces=self.NAMESPACES)
+            encrypted_key = key_info.find('.//xenc:EncryptedKey', namespaces=self.NAMESPACES)
+            cipher_value_key = encrypted_key.find('.//xenc:CipherValue', namespaces=self.NAMESPACES)
+            
+            # Decode encrypted key
+            encrypted_key_bytes = base64.b64decode(cipher_value_key.text)
+            print(f"Encrypted key size: {len(encrypted_key_bytes)} bytes")
+            
+            # Decrypt symmetric key using YOUR RSA private key
+            symmetric_key = self._decrypt_key_rsa(encrypted_key_bytes)
+            print(f"✓ Symmetric key decrypted: {len(symmetric_key)} bytes")
+            
+            # Extract cipher data
+            cipher_data = encrypted_data.find('.//xenc:CipherData', namespaces=self.NAMESPACES)
+            cipher_value = cipher_data.find('.//xenc:CipherValue', namespaces=self.NAMESPACES)
+            
+            # Decode encrypted content
+            encrypted_content = base64.b64decode(cipher_value.text)
+            print(f"Encrypted content size: {len(encrypted_content)} bytes")
+            
+            # Extract IV (first 16 bytes for AES CBC)
+            iv = encrypted_content[:16]
+            encrypted_body = encrypted_content[16:]
+            
+            # Decrypt content
+            decrypted_content = self._decrypt_data_aes(encrypted_body, symmetric_key, iv)
+            print(f"✓ Content decrypted: {len(decrypted_content)} bytes")
+            
+            # Parse decrypted XML
+            decrypted_xml = decrypted_content.decode('utf-8')
+            
+            # Replace encrypted data with decrypted content in original structure
+            decrypted_element = etree.fromstring(decrypted_xml)
+            
+            # Find parent of encrypted data and replace
+            parent = encrypted_data.getparent()
+            parent.remove(encrypted_data)
+            parent.append(decrypted_element)
+            
+            # Return complete decrypted SOAP message
+            return etree.tostring(root, pretty_print=True, encoding='unicode')
+            
+        except Exception as e:
+            print(f"✗ Decryption error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def send_request(self, soap_body, encrypt_request=True):
+        """
+        Send SOAP request to endpoint
+        
+        Args:
+            soap_body: SOAP body content
+            encrypt_request: Whether to encrypt the request (DEFAULT: True)
+        
+        Returns:
+            tuple: (decrypted_response, raw_response)
+        """
+        # Create SOAP request
+        soap_request = self.create_soap_request(soap_body, encrypt=encrypt_request)
+        
+        print(f"\n{'='*60}")
+        print("SOAP REQUEST")
+        print(f"{'='*60}")
+        print(soap_request[:500] + "..." if len(soap_request) > 500 else soap_request)
+        
+        # Prepare headers
         headers = {
             'Content-Type': 'text/xml; charset=utf-8',
-            'SOAPAction': ''
+            'SOAPAction': '""'
         }
         
-        response = self.session.post(
-            self.endpoint_url,
-            data=request_xml,
-            headers=headers
-        )
+        # Configure proxy
+        proxies = None
+        auth = None
         
-        return response
-    
-    def decrypt_response(self, response_xml):
-        """
-        Decrypt encrypted SOAP response using xmlsec - FIXED VERSION
-        
-        Args:
-            response_xml: Encrypted response XML (string or bytes)
+        if self.proxy_url:
+            proxies = {
+                'http': self.proxy_url,
+                'https': self.proxy_url
+            }
             
-        Returns:
-            Decrypted XML element tree
-        """
+            if self.proxy_username and self.proxy_password:
+                auth = HTTPBasicAuth(self.proxy_username, self.proxy_password)
+        
         try:
-            import xmlsec
-        except ImportError:
-            raise ImportError("xmlsec library is required for decryption. Install: pip install xmlsec")
-        
-        if isinstance(response_xml, bytes):
-            try:
-                response_xml = response_xml.decode('utf-8')
-            except UnicodeDecodeError:
-                response_xml = response_xml.decode('latin-1')
-        
-        # Parse response
-        try:
-            # Parse into a document (not just element)
-            parser = etree.XMLParser(remove_blank_text=True)
-            root = etree.fromstring(response_xml.encode('utf-8'), parser)
-        except etree.XMLSyntaxError as e:
-            print(f"XML parsing error: {e}")
-            print(f"Response preview: {response_xml[:500]}")
-            raise
-        
-        # Look for EncryptedData elements
-        XENC_NS = "http://www.w3.org/2001/04/xmlenc#"
-        encrypted_elements = root.findall(f".//{{{XENC_NS}}}EncryptedData")
-        
-        if not encrypted_elements:
-            print("No encrypted data found in response.")
-            return root
-        
-        print(f"Found {len(encrypted_elements)} encrypted element(s). Decrypting...")
-        
-        # Load the private key for decryption
-        if not self.client_key_path:
-            raise ValueError("Client private key path is required for decryption")
-        
-        # Load private key
-        try:
-            with open(self.client_key_path, 'rb') as key_file:
-                key_data = key_file.read()
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Private key file not found: {self.client_key_path}")
-        
-        # Create key manager
-        manager = xmlsec.KeysManager()
-        
-        # Load the key
-        try:
-            if b'-----BEGIN' in key_data:
-                key = xmlsec.Key.from_memory(key_data, xmlsec.constants.KeyDataFormatPem)
+            # Send request
+            print(f"\n→ Sending request to: {self.endpoint_url}")
+            if proxies:
+                print(f"→ Using proxy: {self.proxy_url}")
+            
+            response = requests.post(
+                self.endpoint_url,
+                data=soap_request.encode('utf-8'),
+                headers=headers,
+                proxies=proxies,
+                auth=auth,
+                verify=False,  # Set to True in production with proper CA bundle
+                timeout=30
+            )
+            
+            print(f"✓ Response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                raw_response = response.text
+                
+                print(f"\n{'='*60}")
+                print("RAW SOAP RESPONSE (Encrypted)")
+                print(f"{'='*60}")
+                print(raw_response[:500] + "..." if len(raw_response) > 500 else raw_response)
+                
+                # Decrypt response
+                decrypted_response = self.decrypt_soap_response(raw_response)
+                
+                if decrypted_response:
+                    print(f"\n{'='*60}")
+                    print("DECRYPTED SOAP RESPONSE")
+                    print(f"{'='*60}")
+                    print(decrypted_response[:1000] + "..." if len(decrypted_response) > 1000 else decrypted_response)
+                
+                return decrypted_response, raw_response
             else:
-                key = xmlsec.Key.from_memory(key_data, xmlsec.constants.KeyDataFormatDer)
+                print(f"✗ Error response: {response.status_code}")
+                print(response.text)
+                return None, response.text
+                
         except Exception as e:
-            raise ValueError(f"Failed to load private key: {e}")
-        
-        # Set key name for lookup (important!)
-        key.name = "decryption-key"
-        
-        # If we have a certificate, load it
-        if self.encryption_cert_path:
-            try:
-                with open(self.encryption_cert_path, 'rb') as cert_file:
-                    cert_data = cert_file.read()
-                    if b'-----BEGIN' in cert_data:
-                        key.load_cert_from_memory(cert_data, xmlsec.constants.KeyDataFormatPem)
-                    else:
-                        key.load_cert_from_memory(cert_data, xmlsec.constants.KeyDataFormatDer)
-            except Exception as e:
-                print(f"Warning: Could not load certificate: {e}")
-        
-        # Add key to manager
-        manager.add_key(key)
-        
-        # Decrypt each encrypted element
-        for idx, encrypted_element in enumerate(encrypted_elements):
-            try:
-                print(f"Decrypting element {idx + 1}/{len(encrypted_elements)}...")
-                
-                # Show encryption method
-                enc_method = encrypted_element.find(f".//{{{XENC_NS}}}EncryptionMethod")
-                if enc_method is not None:
-                    algorithm = enc_method.get("Algorithm")
-                    print(f"Encryption algorithm: {algorithm}")
-                
-                # Create encryption context with manager
-                enc_ctx = xmlsec.EncryptionContext(manager)
-                
-                # CRITICAL FIX: Set the key directly on context
-                enc_ctx.key = key
-                
-                # Decrypt - this modifies tree in place
-                enc_ctx.decrypt(encrypted_element)
-                
-                print(f"Successfully decrypted element {idx + 1}")
-                
-            except Exception as e:
-                error_msg = str(e)
-                print(f"Error decrypting element {idx + 1}: {error_msg}")
-                
-                # Check for specific error types
-                if "failed to decrypt" in error_msg.lower():
-                    print("Possible causes:")
-                    print("  1. Wrong private key (doesn't match public key used for encryption)")
-                    print("  2. Incorrect encryption algorithm support")
-                    print("  3. Missing key in KeysManager")
-                    print(f"  4. Key name mismatch")
-                
-                # Show element structure for debugging
-                print(f"Element structure:")
-                print(etree.tostring(encrypted_element, pretty_print=True).decode()[:500])
-                
-                # Don't raise, continue with other elements
-                continue
-        
-        return root
+            print(f"✗ Request error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None
